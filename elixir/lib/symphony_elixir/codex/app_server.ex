@@ -15,8 +15,50 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_sandbox "danger-full-access"
   @turn_sandbox_policy %{"type" => "dangerFullAccess"}
 
+  @type session :: %{
+          port: port(),
+          metadata: map(),
+          thread_id: String.t(),
+          workspace: Path.t()
+        }
+
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
+    with {:ok, session} <- start_session(workspace) do
+      try do
+        run_turn(session, prompt, issue, opts)
+      after
+        stop_session(session)
+      end
+    end
+  end
+
+  @spec start_session(Path.t()) :: {:ok, session()} | {:error, term()}
+  def start_session(workspace) do
+    with :ok <- validate_workspace_cwd(workspace),
+         {:ok, port} <- start_port(workspace) do
+      metadata = port_metadata(port)
+      expanded_workspace = Path.expand(workspace)
+
+      case do_start_session(port, expanded_workspace) do
+        {:ok, thread_id} ->
+          {:ok,
+           %{
+             port: port,
+             metadata: metadata,
+             thread_id: thread_id,
+             workspace: expanded_workspace
+           }}
+
+        {:error, reason} ->
+          stop_port(port)
+          {:error, reason}
+      end
+    end
+  end
+
+  @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def run_turn(%{port: port, metadata: metadata, thread_id: thread_id, workspace: workspace}, prompt, issue, opts \\ []) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
     tool_executor =
@@ -24,65 +66,60 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    with :ok <- validate_workspace_cwd(workspace),
-         {:ok, port} <- start_port(workspace) do
-      metadata = port_metadata(port)
+    case start_turn(port, thread_id, prompt, issue, workspace) do
+      {:ok, turn_id} ->
+        session_id = "#{thread_id}-#{turn_id}"
+        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
-      try do
-        with :ok <- send_initialize(port),
-             {:ok, thread_id} <- start_thread(port, workspace),
-             {:ok, turn_id} <- start_turn(port, thread_id, prompt, issue, workspace) do
-          session_id = "#{thread_id}-#{turn_id}"
-          Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+        emit_message(
+          on_message,
+          :session_started,
+          %{
+            session_id: session_id,
+            thread_id: thread_id,
+            turn_id: turn_id
+          },
+          metadata
+        )
 
-          emit_message(
-            on_message,
-            :session_started,
-            %{
-              session_id: session_id,
-              thread_id: thread_id,
-              turn_id: turn_id
-            },
-            metadata
-          )
+        case await_turn_completion(port, on_message, tool_executor) do
+          {:ok, result} ->
+            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
-          case await_turn_completion(port, on_message, tool_executor) do
-            {:ok, result} ->
-              Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+            {:ok,
+             %{
+               result: result,
+               session_id: session_id,
+               thread_id: thread_id,
+               turn_id: turn_id
+             }}
 
-              {:ok,
-               %{
-                 result: result,
-                 session_id: session_id,
-                 thread_id: thread_id,
-                 turn_id: turn_id
-               }}
-
-            {:error, reason} ->
-              Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
-
-              emit_message(
-                on_message,
-                :turn_ended_with_error,
-                %{
-                  session_id: session_id,
-                  reason: reason
-                },
-                metadata
-              )
-
-              {:error, reason}
-          end
-        else
           {:error, reason} ->
-            Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-            emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+
+            emit_message(
+              on_message,
+              :turn_ended_with_error,
+              %{
+                session_id: session_id,
+                reason: reason
+              },
+              metadata
+            )
+
             {:error, reason}
         end
-      after
-        stop_port(port)
-      end
+
+      {:error, reason} ->
+        Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
+        emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+        {:error, reason}
     end
+  end
+
+  @spec stop_session(session()) :: :ok
+  def stop_session(%{port: port}) when is_port(port) do
+    stop_port(port)
   end
 
   defp validate_workspace_cwd(workspace) when is_binary(workspace) do
@@ -157,6 +194,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     with {:ok, _} <- await_response(port, @initialize_id) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
       :ok
+    end
+  end
+
+  defp do_start_session(port, workspace) do
+    case send_initialize(port) do
+      :ok -> start_thread(port, workspace)
+      {:error, reason} -> {:error, reason}
     end
   end
 

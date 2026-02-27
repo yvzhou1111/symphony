@@ -593,8 +593,11 @@ Important nuance:
 - A successful worker exit does not mean the issue is done forever.
 - The worker may continue through multiple back-to-back coding-agent turns before it exits.
 - After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker should start another turn in the same
-  workspace, up to `agent.max_turns`.
+- If the issue is still in an active state, the worker should start another turn on the same live
+  coding-agent thread in the same workspace, up to `agent.max_turns`.
+- The first turn should use the full rendered task prompt.
+- Continuation turns should send only continuation guidance to the existing thread, not resend the
+  original task prompt that is already present in thread history.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry so it
   can re-check whether the issue remains active and needs another worker session.
 
@@ -911,7 +914,7 @@ semantics):
 {"id":1,"method":"initialize","params":{"clientInfo":{"name":"symphony","version":"1.0"},"capabilities":{}}}
 {"method":"initialized","params":{}}
 {"id":2,"method":"thread/start","params":{"approvalPolicy":"<implementation-defined>","sandbox":"<implementation-defined>","cwd":"/abs/workspace"}}
-{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"<rendered prompt>"}],"cwd":"/abs/workspace","title":"ABC-123: Example","approvalPolicy":"<implementation-defined>","sandboxPolicy":{"type":"<implementation-defined>"}}}
+{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"<rendered prompt-or-continuation-guidance>"}],"cwd":"/abs/workspace","title":"ABC-123: Example","approvalPolicy":"<implementation-defined>","sandboxPolicy":{"type":"<implementation-defined>"}}}
 ```
 
 1. `initialize` request
@@ -932,7 +935,8 @@ semantics):
 4. `turn/start` request
    - Params include:
      - `threadId`
-     - `input` = single text item containing rendered prompt
+     - `input` = single text item containing rendered prompt for the first turn, or continuation
+       guidance for later turns on the same thread
      - `cwd`
      - `title` = `<issue.identifier>: <issue.title>`
      - `approvalPolicy` = implementation-defined turn approval policy value
@@ -942,8 +946,9 @@ semantics):
 Session identifiers:
 
 - Read `thread_id` from `thread/start` result `result.thread.id`
-- Read `turn_id` from `turn/start` result `result.turn.id`
+- Read `turn_id` from each `turn/start` result `result.turn.id`
 - Emit `session_id = "<thread_id>-<turn_id>"`
+- Reuse the same `thread_id` for all continuation turns inside one worker run
 
 ### 10.3 Streaming Turn Processing
 
@@ -956,6 +961,13 @@ Completion conditions:
 - `turn/cancelled` -> failure
 - turn timeout (`turn_timeout_ms`) -> failure
 - subprocess exit -> failure
+
+Continuation processing:
+
+- If the worker decides to continue after a successful turn, it should issue another `turn/start`
+  on the same live `threadId`.
+- The app-server subprocess should remain alive across those continuation turns and be stopped only
+  when the worker run is ending.
 
 Line handling requirements:
 
@@ -1285,8 +1297,16 @@ correctness.
 Token accounting rules:
 
 - Agent events may include token counts in multiple payload shapes.
-- Extract input/output/total token counts leniently from common field names.
-- Track deltas relative to last reported totals to avoid double-counting.
+- Distinguish absolute thread totals from per-event delta payloads.
+- Prefer absolute thread totals when available, such as:
+  - `thread/tokenUsage/updated` payloads
+  - `total_token_usage` within token-count wrapper events
+- Treat `last_token_usage` as a delta-style fallback only when absolute totals are absent.
+- Extract input/output/total token counts leniently from common field names within the selected
+  payload.
+- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
+- For delta-style fallback payloads, add the reported values directly without rewriting the last
+  reported absolute totals.
 - Accumulate aggregate totals in orchestrator state.
 
 Runtime accounting:
@@ -1749,28 +1769,36 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
+  session = app_server.start_session(workspace=workspace.path)
+  if session failed:
+    run_hook_best_effort("after_run", workspace.path)
+    fail_worker("agent session startup error")
+
   max_turns = config.agent.max_turns
   turn_number = 1
 
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
+      app_server.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    session_result = app_server.run(
-      workspace=workspace.path,
+    turn_result = app_server.run_turn(
+      session=session,
       prompt=prompt,
       issue=issue,
       on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
     )
 
-    if session_result failed:
+    if turn_result failed:
+      app_server.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
-      fail_worker("agent session error")
+      fail_worker("agent turn error")
 
     refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
     if refreshed_issue failed:
+      app_server.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -1784,6 +1812,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
+  app_server.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()

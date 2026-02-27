@@ -789,14 +789,17 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
-            exit 0
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
       done
@@ -854,11 +857,27 @@ defmodule SymphonyElixir.CoreTest do
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
-      trace = File.read!(trace_file)
-      assert length(String.split(trace, "RUN:", trim: true)) == 2
-      assert trace =~ "\"text\":\"You are an agent for this repository.\""
-      assert trace =~ "Continuation guidance:"
-      assert trace =~ "continuation turn #2 of 3"
+      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+
+      assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
+      assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
+
+      turn_texts =
+        lines
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
+      refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
+      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
+      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -894,19 +913,23 @@ defmodule SymphonyElixir.CoreTest do
 
       while IFS= read -r line; do
         count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
         case "$count" in
           1)
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
-            exit 0
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
       done
@@ -950,7 +973,8 @@ defmodule SymphonyElixir.CoreTest do
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
 
       trace = File.read!(trace_file)
-      assert length(String.split(trace, "RUN", trim: true)) == 2
+      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

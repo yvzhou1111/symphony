@@ -302,16 +302,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
-    assert snapshot_entry.codex_input_tokens == 8
-    assert snapshot_entry.codex_output_tokens == 3
-    assert snapshot_entry.codex_total_tokens == 12
+    assert snapshot_entry.codex_input_tokens == 10
+    assert snapshot_entry.codex_output_tokens == 5
+    assert snapshot_entry.codex_total_tokens == 16
 
     send(pid, {:DOWN, process_ref, :process, self(), :normal})
     completed_state = :sys.get_state(pid)
 
-    assert completed_state.codex_totals.input_tokens == 8
-    assert completed_state.codex_totals.output_tokens == 3
-    assert completed_state.codex_totals.total_tokens == 12
+    assert completed_state.codex_totals.input_tokens == 10
+    assert completed_state.codex_totals.output_tokens == 5
+    assert completed_state.codex_totals.total_tokens == 16
   end
 
   test "orchestrator snapshot tracks codex rate-limit payloads" do
@@ -393,6 +393,250 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     snapshot = GenServer.call(pid, :snapshot)
     assert snapshot.rate_limits == rate_limits
+  end
+
+  test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do
+    issue_id = "issue-token-precedence"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-222",
+      title: "Token precedence",
+      description: "Prefer per-event deltas",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-222"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenPrecedenceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "info" => %{
+                   "last_token_usage" => %{
+                     "input_tokens" => 2,
+                     "output_tokens" => 1,
+                     "total_tokens" => 3
+                   },
+                   "total_token_usage" => %{
+                     "input_tokens" => 200,
+                     "output_tokens" => 100,
+                     "total_tokens" => 300
+                   }
+                 }
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 200
+    assert snapshot_entry.codex_output_tokens == 100
+    assert snapshot_entry.codex_total_tokens == 300
+  end
+
+  test "orchestrator token accounting accumulates monotonic thread token usage snapshots" do
+    issue_id = "issue-thread-token-usage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-223",
+      title: "Thread token usage",
+      description: "Accumulate absolute thread totals",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-223"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ThreadTokenUsageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    for usage <- [
+          %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11},
+          %{"input_tokens" => 10, "output_tokens" => 4, "total_tokens" => 14}
+        ] do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{"usage" => usage}
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+    end
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 10
+    assert snapshot_entry.codex_output_tokens == 4
+    assert snapshot_entry.codex_total_tokens == 14
+  end
+
+  test "orchestrator token accounting treats last_token_usage as incremental fallback when totals are absent" do
+    issue_id = "issue-last-token-delta"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-224",
+      title: "Last token fallback",
+      description: "Use last_token_usage as delta",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-224"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :LastTokenDeltaOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    for usage <- [
+          %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11},
+          %{"input_tokens" => 5, "output_tokens" => 2, "total_tokens" => 7}
+        ] do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "codex/event/token_count",
+             "params" => %{
+               "msg" => %{
+                 "type" => "event_msg",
+                 "payload" => %{
+                   "type" => "token_count",
+                   "info" => %{"last_token_usage" => usage}
+                 }
+               }
+             }
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+    end
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 13
+    assert snapshot_entry.codex_output_tokens == 5
+    assert snapshot_entry.codex_total_tokens == 18
   end
 
   test "orchestrator snapshot includes retry backoff entries" do
@@ -477,7 +721,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "orchestrator triggers an immediate poll cycle shortly after startup" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_api_token: nil, poll_interval_ms: 5_000)
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      poll_interval_ms: 5_000
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :ImmediateStartupOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -501,7 +748,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                500
              )
 
-    assert %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms, poll_interval_ms: 5_000}} =
+    assert %{
+             polling: %{
+               checking?: false,
+               next_poll_in_ms: next_poll_in_ms,
+               poll_interval_ms: 5_000
+             }
+           } =
              wait_for_snapshot(
                pid,
                fn
@@ -520,7 +773,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "orchestrator poll cycle resets next refresh countdown after a check" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_api_token: nil, poll_interval_ms: 50)
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      poll_interval_ms: 50
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :PollCycleOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -844,7 +1100,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     samples = graph_samples_for_stability_test(now_ms)
 
     graph_at_now = StatusDashboard.tps_graph_for_test(samples, now_ms, current_tokens)
-    graph_next_second = StatusDashboard.tps_graph_for_test(samples, now_ms + 1_000, next_current_tokens)
+
+    graph_next_second =
+      StatusDashboard.tps_graph_for_test(samples, now_ms + 1_000, next_current_tokens)
 
     historical_changes =
       graph_at_now
@@ -929,8 +1187,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {"turn/completed", %{"params" => %{"turn" => %{"status" => "completed"}}}, "turn completed"},
       {"turn/diff/updated", %{"params" => %{"diff" => "line1\nline2"}}, "turn diff updated"},
       {"turn/plan/updated", %{"params" => %{"plan" => [%{"step" => "a"}, %{"step" => "b"}]}}, "plan updated"},
-      {"thread/tokenUsage/updated", %{"params" => %{"usage" => %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11}}}, "thread token usage updated"},
-      {"item/started", %{"params" => %{"item" => %{"id" => "item-1234567890abcdef", "type" => "commandExecution", "status" => "running"}}}, "item started: command execution"},
+      {"thread/tokenUsage/updated",
+       %{
+         "params" => %{
+           "usage" => %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11}
+         }
+       }, "thread token usage updated"},
+      {"item/started",
+       %{
+         "params" => %{
+           "item" => %{
+             "id" => "item-1234567890abcdef",
+             "type" => "commandExecution",
+             "status" => "running"
+           }
+         }
+       }, "item started: command execution"},
       {"item/completed", %{"params" => %{"item" => %{"type" => "fileChange", "status" => "completed"}}}, "item completed: file change"},
       {"item/agentMessage/delta", %{"params" => %{"delta" => "hello"}}, "agent message streaming"},
       {"item/plan/delta", %{"params" => %{"delta" => "step"}}, "plan streaming"},
@@ -947,7 +1219,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     Enum.each(event_cases, fn {method, payload, expected_fragment} ->
       message = Map.put(payload, "method", method)
-      humanized = StatusDashboard.humanize_codex_message(%{event: :notification, message: message})
+
+      humanized =
+        StatusDashboard.humanize_codex_message(%{event: :notification, message: message})
+
       assert humanized =~ expected_fragment
     end)
   end
