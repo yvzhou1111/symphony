@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Config do
   @default_active_states ["Todo", "In Progress"]
   @default_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
   @default_linear_endpoint "https://api.linear.app/graphql"
+  @default_bd_command "bd"
   @default_prompt_template """
   You are working on a Linear issue.
 
@@ -51,6 +52,8 @@ defmodule SymphonyElixir.Config do
                                keys: [
                                  kind: [type: {:or, [:string, nil]}, default: nil],
                                  endpoint: [type: :string, default: @default_linear_endpoint],
+                                 command: [type: :string, default: @default_bd_command],
+                                 repo_root: [type: {:or, [:string, nil]}, default: nil],
                                  api_key: [type: {:or, [:string, nil]}, default: nil],
                                  project_slug: [type: {:or, [:string, nil]}, default: nil],
                                  assignee: [type: {:or, [:string, nil]}, default: nil],
@@ -186,6 +189,18 @@ defmodule SymphonyElixir.Config do
   @spec linear_endpoint() :: String.t()
   def linear_endpoint do
     get_in(validated_workflow_options(), [:tracker, :endpoint])
+  end
+
+  @spec bd_command() :: String.t()
+  def bd_command do
+    get_in(validated_workflow_options(), [:tracker, :command])
+  end
+
+  @spec bd_repo_root() :: Path.t() | nil
+  def bd_repo_root do
+    validated_workflow_options()
+    |> get_in([:tracker, :repo_root])
+    |> resolve_optional_path_value()
   end
 
   @spec linear_api_token() :: String.t() | nil
@@ -366,6 +381,7 @@ defmodule SymphonyElixir.Config do
     with {:ok, _workflow} <- current_workflow(),
          :ok <- require_tracker_kind(),
          :ok <- require_linear_token(),
+         :ok <- require_bd_repo_root(),
          :ok <- require_linear_project(),
          :ok <- require_valid_codex_runtime_settings() do
       require_codex_command()
@@ -390,6 +406,7 @@ defmodule SymphonyElixir.Config do
     case tracker_kind() do
       "linear" -> :ok
       "memory" -> :ok
+      "bd" -> :ok
       nil -> {:error, :missing_tracker_kind}
       other -> {:error, {:unsupported_tracker_kind, other}}
     end
@@ -402,6 +419,20 @@ defmodule SymphonyElixir.Config do
           :ok
         else
           {:error, :missing_linear_api_token}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp require_bd_repo_root do
+    case tracker_kind() do
+      "bd" ->
+        if is_binary(bd_repo_root()) do
+          :ok
+        else
+          {:error, :missing_bd_repo_root}
         end
 
       _ ->
@@ -461,6 +492,8 @@ defmodule SymphonyElixir.Config do
     %{}
     |> put_if_present(:kind, normalize_tracker_kind(scalar_string_value(Map.get(section, "kind"))))
     |> put_if_present(:endpoint, scalar_string_value(Map.get(section, "endpoint")))
+    |> put_if_present(:command, command_value(Map.get(section, "command")))
+    |> put_if_present(:repo_root, binary_value(Map.get(section, "repo_root")))
     |> put_if_present(:api_key, binary_value(Map.get(section, "api_key"), allow_empty: true))
     |> put_if_present(:project_slug, scalar_string_value(Map.get(section, "project_slug")))
     |> put_if_present(:active_states, csv_value(Map.get(section, "active_states")))
@@ -860,6 +893,26 @@ defmodule SymphonyElixir.Config do
   end
 
   defp resolve_path_value(_value, default), do: default
+
+  defp resolve_optional_path_value(nil), do: nil
+  defp resolve_optional_path_value(:missing), do: nil
+
+  defp resolve_optional_path_value(value) when is_binary(value) do
+    case normalize_path_token(value) do
+      :missing ->
+        nil
+
+      path ->
+        path
+        |> String.trim()
+        |> then(fn
+          "" -> nil
+          resolved -> Path.expand(resolved)
+        end)
+    end
+  end
+
+  defp resolve_optional_path_value(_value), do: nil
 
   defp preserve_command_name(path) do
     cond do

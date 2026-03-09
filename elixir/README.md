@@ -65,6 +65,39 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+
+## Local Ubuntu mode with `bd`
+
+If you want the simplest all-local workflow on Ubuntu, use the bundled `bin/symphony-local`
+launcher. It keeps Symphony local, uses `bd` as the task source, starts the dashboard on an
+uncommon port, and lets you submit tasks from the command line.
+
+Requirements:
+
+```bash
+npm install -g @openai/codex beads
+```
+
+Common commands:
+
+```bash
+cd symphony/elixir
+./bin/symphony-local start /path/to/your/repo --port 43117
+./bin/symphony-local task /path/to/your/repo "Add API tests for image search"
+./bin/symphony-local do /path/to/your/repo "Optimize dashboard refresh"
+./bin/symphony-local status /path/to/your/repo
+./bin/symphony-local stop /path/to/your/repo
+```
+
+Inside the target repo, you can omit the path:
+
+```bash
+symphony-local do "Improve caching for source probes"
+```
+
+The launcher generates a repo-local workflow at `.symphony/WORKFLOW.bd.md`, uses `bd` for
+polling ready work, and exposes the observability dashboard at `http://127.0.0.1:<port>/`.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:

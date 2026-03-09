@@ -31,6 +31,9 @@ Check out [elixir/README.md](elixir/README.md) for instructions on how to set up
 and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
 help with the setup:
 
+For an Ubuntu-first all-local workflow, the Elixir implementation also ships with a `bd`/beads launcher for local task orchestration. See [elixir/README.md](elixir/README.md) for the `symphony-local` flow.
+
+
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 

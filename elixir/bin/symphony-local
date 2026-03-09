@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ELIXIR_DIR="$(cd "$SELF_DIR/.." && pwd)"
+DEFAULT_PORT="43117"
+ACK="--i-understand-that-this-will-be-running-without-the-usual-guardrails"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/symphony-local"
+WORKSPACE_ROOT_BASE="${SYMPHONY_LOCAL_WORKSPACE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/symphony-local/workspaces}"
+DEFAULT_CODEX_COMMAND='codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server'
+
+usage() {
+  cat <<USAGE
+Usage:
+  symphony-local start [repo_path] [--port PORT]
+  symphony-local task [repo_path] "Title" [--description TEXT] [--priority P] [--type TYPE]
+  symphony-local do [repo_path] "Title" [--description TEXT] [--port PORT]
+  symphony-local status [repo_path]
+  symphony-local stop [repo_path]
+  symphony-local logs [repo_path]
+  symphony-local workflow [repo_path] [--port PORT]
+
+Examples:
+  symphony-local start ~/code/my-repo --port 43117
+  symphony-local task ~/code/my-repo "修复登录流程"
+  symphony-local do ~/code/my-repo "给 API 增加缓存和测试"
+  cd ~/code/my-repo && symphony-local do "优化首页加载速度"
+USAGE
+}
+
+yaml_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//"/\\"}"
+  printf '%s' "$value"
+}
+
+repo_default() {
+  git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+repo_slug() {
+  local repo="$1"
+  basename "$repo"
+}
+
+repo_state_dir() {
+  local repo="$1"
+  local slug hash
+  slug="$(repo_slug "$repo")"
+  hash="$(printf '%s' "$repo" | sha1sum | awk '{print substr($1,1,12)}')"
+  printf '%s/%s-%s' "$STATE_ROOT" "$slug" "$hash"
+}
+
+ensure_repo() {
+  local repo="$1"
+  if [[ ! -d "$repo" ]]; then
+    echo "Repository path not found: $repo" >&2
+    exit 1
+  fi
+}
+
+ensure_bd_repo() {
+  local repo="$1"
+  ensure_repo "$repo"
+  if [[ ! -d "$repo/.beads" ]]; then
+    echo "Initializing bd in $repo" >&2
+    (cd "$repo" && bd init --json >/dev/null)
+  fi
+}
+
+port_from_workflow() {
+  local workflow="$1"
+  python - "$workflow" <<'PY'
+from pathlib import Path
+import re, sys
+text = Path(sys.argv[1]).read_text() if Path(sys.argv[1]).exists() else ''
+match = re.search(r'^\s*port:\s*(\d+)\s*$', text, re.MULTILINE)
+print(match.group(1) if match else '')
+PY
+}
+
+write_workflow() {
+  local repo="$1"
+  local port="$2"
+  local workflow_dir workflow_path workspace_root repo_escaped codex_command bd_command
+  workflow_dir="$repo/.symphony"
+  workflow_path="$workflow_dir/WORKFLOW.bd.md"
+  workspace_root="$WORKSPACE_ROOT_BASE/$(repo_slug "$repo")"
+  mkdir -p "$workflow_dir" "$workspace_root"
+  repo_escaped="$(yaml_escape "$repo")"
+  bd_command="$(yaml_escape "${SYMPHONY_LOCAL_BD_COMMAND:-bd}")"
+  codex_command="$(yaml_escape "${SYMPHONY_LOCAL_CODEX_COMMAND:-$DEFAULT_CODEX_COMMAND}")"
+  cat > "$workflow_path" <<EOF_WORKFLOW
+---
+tracker:
+  kind: "bd"
+  repo_root: "$repo_escaped"
+  command: "$bd_command"
+  active_states: ["Todo", "In Progress"]
+  terminal_states: ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"]
+polling:
+  interval_ms: 5000
+workspace:
+  root: "$(yaml_escape "$workspace_root")"
+hooks:
+  after_create: |
+    git clone --depth 1 "$repo_escaped" .
+agent:
+  max_concurrent_agents: 2
+  max_turns: 20
+codex:
+  command: "$codex_command"
+observability:
+  dashboard_enabled: true
+server:
+  host: "127.0.0.1"
+  port: $port
+---
+
+You are working on a local bd issue \`{{ issue.identifier }}\`.
+
+Title: {{ issue.title }}
+
+Description:
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No description provided.
+{% endif %}
+
+Requirements:
+1. Work only inside the provided repository copy.
+2. Use the local \`bd\` CLI in the repository to keep progress updated when meaningful milestones happen.
+3. If blocked, add a concise \`bd\` comment describing the blocker.
+4. When complete, close the bd issue with a short completion reason.
+5. Do not ask the human to perform follow-up actions unless you truly need a missing secret or permission.
+EOF_WORKFLOW
+  printf '%s\n' "$workflow_path"
+}
+
+ensure_built() {
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+  (cd "$ELIXIR_DIR" && mise exec -- mix build >/dev/null)
+}
+
+start_service() {
+  local repo="$1"
+  local port="$2"
+  ensure_bd_repo "$repo"
+  ensure_built
+  local workflow state_dir pidfile logfile pid
+  workflow="$(write_workflow "$repo" "$port")"
+  state_dir="$(repo_state_dir "$repo")"
+  pidfile="$state_dir/pid"
+  logfile="$state_dir/symphony.log"
+  mkdir -p "$state_dir"
+
+  if [[ -f "$pidfile" ]]; then
+    pid="$(cat "$pidfile")"
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Symphony already running for $repo"
+      echo "Dashboard: http://127.0.0.1:$port/"
+      return 0
+    fi
+  fi
+
+  nohup bash -lc "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:\$PATH\"; cd \"$ELIXIR_DIR\" && exec mise exec -- ./bin/symphony $ACK --port $port \"$workflow\"" >"$logfile" 2>&1 &
+  echo $! > "$pidfile"
+  echo "$port" > "$state_dir/port"
+  echo "$workflow" > "$state_dir/workflow"
+
+  for _ in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:$port/api/v1/state" >/dev/null 2>&1; then
+      echo "Started Symphony for $repo"
+      echo "Dashboard: http://127.0.0.1:$port/"
+      echo "Logs: $logfile"
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "Symphony started but dashboard did not respond yet. Logs: $logfile" >&2
+}
+
+create_task() {
+  local repo="$1"
+  local title="$2"
+  local description="$3"
+  local priority="$4"
+  local type="$5"
+  ensure_bd_repo "$repo"
+  if [[ -n "$description" ]]; then
+    (cd "$repo" && bd create "$title" --description="$description" -t "$type" -p "$priority" --json)
+  else
+    (cd "$repo" && bd create "$title" -t "$type" -p "$priority" --json)
+  fi
+}
+
+show_status() {
+  local repo="$1"
+  local state_dir port
+  state_dir="$(repo_state_dir "$repo")"
+  if [[ -f "$state_dir/port" ]]; then
+    port="$(cat "$state_dir/port")"
+  else
+    port="$DEFAULT_PORT"
+  fi
+  curl -fsS "http://127.0.0.1:$port/api/v1/state"
+  echo
+}
+
+stop_service() {
+  local repo="$1"
+  local state_dir pidfile pid
+  state_dir="$(repo_state_dir "$repo")"
+  pidfile="$state_dir/pid"
+  if [[ ! -f "$pidfile" ]]; then
+    echo "No running Symphony service recorded for $repo" >&2
+    return 1
+  fi
+  pid="$(cat "$pidfile")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    echo "Stopped Symphony for $repo"
+  else
+    echo "Recorded PID is not running: $pid" >&2
+  fi
+  rm -f "$pidfile"
+}
+
+show_logs() {
+  local repo="$1"
+  local state_dir logfile
+  state_dir="$(repo_state_dir "$repo")"
+  logfile="$state_dir/symphony.log"
+  if [[ ! -f "$logfile" ]]; then
+    echo "Log file not found: $logfile" >&2
+    exit 1
+  fi
+  tail -f "$logfile"
+}
+
+resolve_repo_arg() {
+  local candidate="${1:-}"
+  if [[ -n "$candidate" && -d "$candidate" ]]; then
+    repo_default "$candidate"
+  else
+    repo_default "$PWD"
+  fi
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  local command="$1"
+  shift
+
+  case "$command" in
+    start)
+      local repo port
+      repo="$(resolve_repo_arg "${1:-}")"
+      if [[ $# -gt 0 && -d "$1" ]]; then shift; fi
+      port="$DEFAULT_PORT"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --port) port="$2"; shift 2 ;;
+          *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+      done
+      start_service "$repo" "$port"
+      ;;
+    workflow)
+      local repo port
+      repo="$(resolve_repo_arg "${1:-}")"
+      if [[ $# -gt 0 && -d "$1" ]]; then shift; fi
+      port="$DEFAULT_PORT"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --port) port="$2"; shift 2 ;;
+          *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+      done
+      ensure_bd_repo "$repo"
+      write_workflow "$repo" "$port"
+      ;;
+    task)
+      local repo title description priority type
+      repo="$(resolve_repo_arg "${1:-}")"
+      if [[ $# -gt 0 && -d "$1" ]]; then shift; fi
+      if [[ $# -lt 1 ]]; then
+        echo "task requires a title" >&2
+        exit 1
+      fi
+      title="$1"
+      shift
+      description=""
+      priority="1"
+      type="task"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --description) description="$2"; shift 2 ;;
+          --priority) priority="$2"; shift 2 ;;
+          --type) type="$2"; shift 2 ;;
+          *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+      done
+      create_task "$repo" "$title" "$description" "$priority" "$type"
+      ;;
+    do)
+      local repo title description port
+      repo="$(resolve_repo_arg "${1:-}")"
+      if [[ $# -gt 0 && -d "$1" ]]; then shift; fi
+      if [[ $# -lt 1 ]]; then
+        echo "do requires a title" >&2
+        exit 1
+      fi
+      title="$1"
+      shift
+      description=""
+      port="$DEFAULT_PORT"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --description) description="$2"; shift 2 ;;
+          --port) port="$2"; shift 2 ;;
+          *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+      done
+      start_service "$repo" "$port"
+      create_task "$repo" "$title" "$description" "1" "task"
+      ;;
+    status)
+      local repo
+      repo="$(resolve_repo_arg "${1:-}")"
+      show_status "$repo"
+      ;;
+    stop)
+      local repo
+      repo="$(resolve_repo_arg "${1:-}")"
+      stop_service "$repo"
+      ;;
+    logs)
+      local repo
+      repo="$(resolve_repo_arg "${1:-}")"
+      show_logs "$repo"
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

@@ -37,6 +37,9 @@ erl_crash.dump
 .idea/
 .vscode/
 /bin/
+!/bin/
+/bin/*
+!/bin/symphony-local
 
 # Local environment and auth artifacts.
 .env

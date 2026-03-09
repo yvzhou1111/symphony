@@ -94,6 +94,8 @@ defmodule SymphonyElixir.TestSupport do
         [
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
+          tracker_command: "bd",
+          tracker_repo_root: nil,
           tracker_api_token: "token",
           tracker_project_slug: "project",
           tracker_assignee: nil,
@@ -129,6 +131,8 @@ defmodule SymphonyElixir.TestSupport do
 
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
+    tracker_command = Keyword.get(config, :tracker_command)
+    tracker_repo_root = Keyword.get(config, :tracker_repo_root)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
@@ -165,6 +169,8 @@ defmodule SymphonyElixir.TestSupport do
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
+        "  command: #{yaml_value(tracker_command)}",
+        "  repo_root: #{yaml_value(tracker_repo_root)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
