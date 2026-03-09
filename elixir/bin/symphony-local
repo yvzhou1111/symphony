@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  SOURCE_PATH="$(readlink -f "$SOURCE_PATH" 2>/dev/null || printf '%s' "$SOURCE_PATH")"
+fi
+SELF_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 ELIXIR_DIR="$(cd "$SELF_DIR/.." && pwd)"
 DEFAULT_PORT="43117"
 ACK="--i-understand-that-this-will-be-running-without-the-usual-guardrails"
@@ -36,7 +40,7 @@ yaml_escape() {
 }
 
 repo_default() {
-  git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null || pwd
+  git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null
 }
 
 repo_slug() {
@@ -244,10 +248,14 @@ show_logs() {
 resolve_repo_arg() {
   local candidate="${1:-}"
   if [[ -n "$candidate" && -d "$candidate" ]]; then
-    repo_default "$candidate"
-  else
-    repo_default "$PWD"
+    repo_default "$candidate" || { echo "Not a git repository: $candidate" >&2; exit 1; }
+    return
   fi
+
+  repo_default "$PWD" || {
+    echo "Please run inside a git repository, or pass an explicit repo path." >&2
+    exit 1
+  }
 }
 
 main() {
